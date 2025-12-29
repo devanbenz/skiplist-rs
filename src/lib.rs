@@ -1,4 +1,10 @@
+pub mod array;
+pub mod sl_lock_free;
+
 use rand::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub trait Min<T> {
@@ -29,7 +35,7 @@ where
 
 pub struct SkipList<K, V> {
     max_level: usize,
-    cur_level: usize,
+    cur_level: AtomicUsize,
     nodes: Arc<RwLock<Node<K, V>>>,
 }
 
@@ -43,12 +49,12 @@ where
         let new_node: Node<K, V> = Node::new(<K as Min<K>>::min(), None, max_level + 1);
         Self {
             max_level,
-            cur_level: 0,
+            cur_level: AtomicUsize::new(0),
             nodes: Arc::new(RwLock::new(new_node)),
         }
     }
 
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn insert(&self, key: K, value: V) {
         let mut curr = self.nodes.clone();
         let mut update: Vec<Option<Arc<RwLock<Node<K, V>>>>> = vec![None; self.max_level + 1];
 
@@ -77,11 +83,11 @@ where
         }
 
         let lvl = Self::random_level(self.max_level);
-        if lvl > self.cur_level {
-            for i in self.cur_level + 1..=lvl {
+        if lvl > self.cur_level.load(Ordering::Acquire) {
+            for i in self.cur_level.load(Ordering::Acquire) + 1..=lvl {
                 update[i] = Some(Arc::clone(&self.nodes));
             }
-            self.cur_level = lvl;
+            self.cur_level.store(lvl, Ordering::Release);
         }
 
         let new_node = Arc::new(RwLock::new(Node::new(key, Some(value), lvl + 1)));
@@ -99,7 +105,7 @@ where
     {
         let mut curr = Arc::clone(&self.nodes);
 
-        for i in (0..=self.cur_level).rev() {
+        for i in (0..=self.cur_level.load(Ordering::Acquire)).rev() {
             while let Some(next) = curr.clone().read().unwrap().forward[i].clone() {
                 let next_guard = next.read().unwrap();
 
@@ -125,21 +131,27 @@ where
     }
 }
 
+// Traits for arbitrary types
+impl Min<i32> for i32 {
+    fn min() -> i32 {
+        i32::MIN
+    }
+}
+
+impl Min<u64> for u64 {
+    fn min() -> u64 {
+        u64::MIN
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    impl Min<i32> for i32 {
-        fn min() -> i32 {
-            i32::MIN
-        }
-    }
-
     #[test]
     fn skiplist_test() {
-        let mut skip_list: SkipList<i32, i32> = SkipList::new(3);
+        let skip_list: SkipList<i32, i32> = SkipList::new(3);
         assert_eq!(skip_list.max_level, 3);
-        assert_eq!(skip_list.cur_level, 0);
         skip_list.insert(1, 2);
         skip_list.insert(2, 3);
         skip_list.insert(3, 4);
