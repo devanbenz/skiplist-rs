@@ -1,4 +1,3 @@
-use rand::Rng;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub trait Min<T> {
@@ -355,8 +354,7 @@ mod skiplist_tests {
         assert_eq!(sl.get(&4), Some(&2));
     }
 
-    #[test]
-    fn skiplist_data_race_test() {
+    fn run_data_race(iteration: usize) {
         let sl = Arc::new(SkipList::<i32, i32, 5>::new());
         let mut handles = vec![];
 
@@ -366,7 +364,10 @@ mod skiplist_tests {
                 for i in 1..=10 {
                     if sl.get(&0).is_none() {
                         sl.insert(0, i);
-                        println!("thread_id={} inserting={}", thread_id, i);
+                        println!(
+                            "thread_id={} inserting={}, new data! Should only see this once",
+                            thread_id, i
+                        );
                     } else {
                         let v = sl.get(&0).unwrap();
                         println!("thread_id={} get={}", thread_id, v);
@@ -384,6 +385,17 @@ mod skiplist_tests {
 
         let val = sl.get(&0);
         assert!(val.is_some());
-        assert_eq!(val, Some(&40));
+        assert_eq!(
+            val,
+            Some(&40),
+            "data race detected, failed on iteration={iteration}"
+        );
+    }
+
+    #[test]
+    fn skiplist_data_race_test() {
+        for i in 0..100 {
+            run_data_race(i);
+        }
     }
 }
