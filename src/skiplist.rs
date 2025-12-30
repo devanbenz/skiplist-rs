@@ -323,6 +323,8 @@ impl Min<i32> for i32 {
 #[cfg(test)]
 mod skiplist_tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn new_skiplist() {
@@ -351,5 +353,37 @@ mod skiplist_tests {
         assert_eq!(sl.get(&2), Some(&2));
         assert_eq!(sl.get(&3), Some(&2));
         assert_eq!(sl.get(&4), Some(&2));
+    }
+
+    #[test]
+    fn skiplist_data_race_test() {
+        let sl = Arc::new(SkipList::<i32, i32, 5>::new());
+        let mut handles = vec![];
+
+        for thread_id in 0..4 {
+            let sl = Arc::clone(&sl);
+            let handle = thread::spawn(move || {
+                for i in 1..=10 {
+                    if sl.get(&0).is_none() {
+                        sl.insert(0, i);
+                        println!("thread_id={} inserting={}", thread_id, i);
+                    } else {
+                        let v = sl.get(&0).unwrap();
+                        println!("thread_id={} get={}", thread_id, v);
+                        println!("thread_id={} inserting={}", thread_id, v + 1);
+                        sl.insert(0, v + 1);
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let val = sl.get(&0);
+        assert!(val.is_some());
+        assert_eq!(val, Some(&40));
     }
 }
