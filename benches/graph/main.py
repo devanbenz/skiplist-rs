@@ -56,7 +56,7 @@ def parse_benchmarks(text):
 
 if __name__ == '__main__':
     os.chdir("../..")
-    data = run("cargo bench --package skiplist-rs", capture_output=True, shell=True, text=True)
+    data = run("cargo bench --profile release", capture_output=True, shell=True, text=True)
 
     results = parse_benchmarks(data.stdout)
 

@@ -30,6 +30,19 @@ Run benchmarks
 cargo bench --package skiplist-rs
 ```
 
-Performance compared to `std::collections::BtreeMap` in a multi-threaded environment
+Performance compared to `std::collections::BtreeMap` in a multi-threaded environment (lower is better).
+
+Hardware specifications
+
+```
+  Model name:                12th Gen Intel(R) Core(TM) i7-12700K
+    CPU family:              6
+    Model:                   151
+    Thread(s) per core:      2
+    Core(s) per socket:      12
+    Socket(s):               1
+```
 
 ![plot](benchmark_comparison.png)
+
+*performance may vary depending on hardware*
