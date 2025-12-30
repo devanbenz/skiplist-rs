@@ -1,0 +1,8 @@
+[project]
+name = "graph"
+version = "0.1.0"
+description = "Creates a graph for skiplist-rs benchmarks"
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib>=3.9.4",
+]

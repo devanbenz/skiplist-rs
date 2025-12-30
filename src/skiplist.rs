@@ -1,12 +1,18 @@
-use std::sync::atomic;
+use rand::Rng;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub trait Min<T> {
     fn min() -> T;
 }
 
+impl Min<u64> for u64 {
+    fn min() -> u64 {
+        u64::MIN
+    }
+}
+
 #[derive(Debug)]
-struct Node<K, V, const N: usize> {
+pub struct Node<K, V, const N: usize> {
     key: K,
     value: Option<V>,
     height: AtomicUsize,
@@ -14,7 +20,7 @@ struct Node<K, V, const N: usize> {
 }
 
 impl<K, V, const N: usize> Node<K, V, N> {
-    fn new(key: K, value: Option<V>, height: AtomicUsize) -> Self {
+    pub fn new(key: K, value: Option<V>, height: AtomicUsize) -> Self {
         let forward: [AtomicPtr<Node<K, V, N>>; N] =
             std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut()));
         Self {
@@ -65,7 +71,7 @@ impl<K, V, const N: usize> Node<K, V, N> {
     }
 }
 
-struct SkipList<K, V, const N: usize>
+pub struct SkipList<K, V, const N: usize>
 where
     K: Min<K>,
 {
@@ -76,12 +82,12 @@ where
 
 impl<K, V, const N: usize> SkipList<K, V, N>
 where
-    K: Min<K>,
+    K: Min<K> + PartialOrd<K> + Eq + Ord,
 {
     pub fn new() -> Self {
         let node_ptr: AtomicPtr<Node<K, V, N>> = AtomicPtr::new(std::ptr::null_mut());
         let new_node = Box::into_raw(Box::new(Node::<K, V, N>::new(
-            K::min(),
+            <K as Min<K>>::min(),
             None,
             AtomicUsize::new(N),
         )));
@@ -110,10 +116,119 @@ where
         unsafe { v.read() }
     }
 
-    pub fn insert(&self, key: K, value: V) {}
+    // TODO: Make this actually thread safe
+    pub fn insert(&self, key: K, value: V) {
+        let head_ptr = self.head.load(Ordering::Acquire);
+        let mut update: [*mut Node<K, V, N>; N] = [std::ptr::null_mut(); N];
+        let current_height = self.height();
+        let mut curr_ptr = head_ptr;
+
+        for i in (0..=current_height).rev() {
+            loop {
+                unsafe {
+                    match (*curr_ptr).forward.get(i) {
+                        Some(next_atomic) => {
+                            let next_ptr = next_atomic.load(Ordering::Acquire);
+
+                            if next_ptr.is_null() {
+                                break;
+                            }
+
+                            if (*next_ptr).key() < &key {
+                                curr_ptr = next_ptr;
+                            } else {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+            update[i] = curr_ptr;
+        }
+
+        let next = unsafe { (*head_ptr).forward(0).load(Ordering::Acquire) };
+        if !next.is_null() {
+            // TODO: Compare and swap instead of assignment
+            unsafe {
+                if (*next).key == key {
+                    (*next).value = Some(value);
+                    return;
+                }
+            };
+        }
+
+        let lvl = Self::random_level(self.max_height());
+        if lvl > self.height() {
+            for i in self.height() + 1..=lvl {
+                update[i] = head_ptr;
+            }
+            loop {
+                match self.cur_height.compare_exchange(
+                    self.height(),
+                    lvl,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let new_node = Box::into_raw(Box::new(Node::<K, V, N>::new(
+            key,
+            Some(value),
+            AtomicUsize::from(lvl + 1),
+        )));
+        for i in 0..=lvl {
+            unsafe {
+                let update_ptr = update[i];
+                (*new_node).forward(i).store(
+                    (*update_ptr).forward(i).load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                (*update_ptr).forward(i).store(new_node, Ordering::Release);
+            }
+        }
+    }
 
     pub fn get(&self, key: &K) -> Option<&V> {
+        let mut curr = self.head.load(Ordering::Acquire);
+        for i in (0..=self.height()).rev() {
+            if unsafe { i < (*curr).height() } {
+                loop {
+                    let fwd = unsafe { (*curr).forward(i).load(Ordering::Acquire) };
+                    if fwd.is_null() {
+                        break;
+                    };
+
+                    match unsafe { (*fwd).key.cmp(key) } {
+                        std::cmp::Ordering::Less => {
+                            curr = fwd;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let val = unsafe { (*fwd).value.as_ref() };
+                            return val;
+                        }
+                        std::cmp::Ordering::Greater => break,
+                    }
+                }
+            }
+        }
+
         None
+    }
+
+    fn random_level(max_level: usize) -> usize {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let mut level = 0;
+        // Geometric distribution: 50% chance to go up each level
+        while level < max_level - 1 && rng.random_bool(0.5) {
+            level += 1;
+        }
+        level
     }
 }
 
@@ -216,5 +331,25 @@ mod skiplist_tests {
         assert_eq!(sl.cur_height.load(Ordering::Acquire), 0);
         assert_eq!(sl.head().key(), &i32::MIN);
         assert_eq!(sl.head().value(), None);
+    }
+
+    #[test]
+    fn skiplist_insert_and_get() {
+        let sl = SkipList::<i32, i32, 5>::new();
+        sl.insert(0, 0);
+        sl.insert(1, 1);
+        sl.insert(2, 2);
+        sl.insert(3, 2);
+        sl.insert(4, 2);
+        assert_eq!(sl.max_height.load(Ordering::Acquire), 5);
+        assert_ne!(sl.cur_height.load(Ordering::Acquire), 0);
+        assert_eq!(sl.head().key(), &i32::MIN);
+        assert_eq!(sl.head().value(), None);
+
+        assert_eq!(sl.get(&0), Some(&0));
+        assert_eq!(sl.get(&1), Some(&1));
+        assert_eq!(sl.get(&2), Some(&2));
+        assert_eq!(sl.get(&3), Some(&2));
+        assert_eq!(sl.get(&4), Some(&2));
     }
 }

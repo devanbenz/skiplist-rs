@@ -1,7 +1,7 @@
-use skiplist_rs::sl_lock_free::SkipListNoLock;
+use skiplist_rs::skiplist::SkipList;
 
 fn main() {
-    let sl = SkipListNoLock::<i32, i32, 6>::new();
+    let sl = SkipList::<i32, i32, 6>::new();
     for i in 0..10_000 {
         println!("iteration {}", i);
         sl.insert(i, i);
