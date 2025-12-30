@@ -14,3 +14,14 @@ jobs:
         run: cargo build --profile ${{ matrix.BUILD_TARGET }}
       - name: Run tests in "${{ matrix.BUILD_TARGET }}" mode
         run: cargo test --profile ${{ matrix.BUILD_TARGET }}
+  run_benchmark:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        BUILD_TARGET: [ release ]
+    outputs:
+      release_built: ${{ steps.set-output.outputs.release_built }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run benchmarks in "${{ matrix.BUILD_TARGET }}" mode
+        run: cargo bench --profile ${{ matrix.BUILD_TARGET }}
