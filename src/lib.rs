@@ -1,9 +1,8 @@
 pub mod array;
+mod skiplist;
 pub mod sl_lock_free;
 
 use rand::prelude::*;
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
