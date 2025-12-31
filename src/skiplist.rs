@@ -13,13 +13,13 @@ impl Min<u64> for u64 {
 #[derive(Debug)]
 pub struct Node<K, V, const N: usize> {
     key: K,
-    value: Option<V>,
+    value: Option<AtomicPtr<V>>,
     height: AtomicUsize,
     forward: [AtomicPtr<Node<K, V, N>>; N],
 }
 
 impl<K, V, const N: usize> Node<K, V, N> {
-    pub fn new(key: K, value: Option<V>, height: AtomicUsize) -> Self {
+    pub fn new(key: K, value: Option<AtomicPtr<V>>, height: AtomicUsize) -> Self {
         let forward: [AtomicPtr<Node<K, V, N>>; N] =
             std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut()));
         Self {
@@ -54,7 +54,7 @@ impl<K, V, const N: usize> Node<K, V, N> {
         &self.key
     }
 
-    pub fn value(&self) -> Option<&V> {
+    pub fn value(&self) -> Option<&AtomicPtr<V>> {
         self.value.as_ref()
     }
 
@@ -81,7 +81,8 @@ where
 
 impl<K, V, const N: usize> SkipList<K, V, N>
 where
-    K: Min<K> + PartialOrd<K> + Eq + Ord,
+    K: Min<K> + PartialOrd<K> + Eq + Ord + Copy,
+    V: Copy,
 {
     pub fn new() -> Self {
         let node_ptr: AtomicPtr<Node<K, V, N>> = AtomicPtr::new(std::ptr::null_mut());
@@ -116,11 +117,11 @@ where
     }
 
     // TODO: Make this actually thread safe
-    pub fn insert(&self, key: K, value: V) {
+    pub fn insert(&self, key: K, value: AtomicPtr<V>) {
         let head_ptr = self.head.load(Ordering::Acquire);
+        let mut curr_ptr = head_ptr;
         let mut update: [*mut Node<K, V, N>; N] = [std::ptr::null_mut(); N];
         let current_height = self.height();
-        let mut curr_ptr = head_ptr;
 
         for i in (0..=current_height).rev() {
             loop {
@@ -146,15 +147,12 @@ where
             update[i] = curr_ptr;
         }
 
-        let next = unsafe { (*head_ptr).forward(0).load(Ordering::Acquire) };
-        if !next.is_null() {
-            // TODO: Compare and swap instead of assignment
+        let next = unsafe { (*curr_ptr).forward(0).load(Ordering::Acquire) };
+        if !next.is_null() && unsafe { (*next).key() == &key } {
             unsafe {
-                if (*next).key == key {
-                    (*next).value = Some(value);
-                    return;
-                }
-            };
+                (*next).value = Some(value);
+            }
+            return;
         }
 
         let lvl = Self::random_level(self.max_height());
@@ -166,8 +164,8 @@ where
                 match self.cur_height.compare_exchange(
                     self.height(),
                     lvl,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+                    Ordering::Release,
+                    Ordering::Relaxed,
                 ) {
                     Ok(_) => break,
                     Err(_) => {}
@@ -183,16 +181,17 @@ where
         for i in 0..=lvl {
             unsafe {
                 let update_ptr = update[i];
-                (*new_node).forward(i).store(
-                    (*update_ptr).forward(i).load(Ordering::Acquire),
-                    Ordering::Release,
-                );
-                (*update_ptr).forward(i).store(new_node, Ordering::Release);
+                if update_ptr.is_null() {
+                    panic!("update pointer must not be null");
+                }
+                let expected = (*update_ptr).forward(i).load(Ordering::Acquire);
+                (*new_node).forward(i).store(expected, Ordering::Release);
+                (*update_ptr).forward(i).store(new_node, Ordering::Release)
             }
         }
     }
 
-    pub fn get(&self, key: &K) -> Option<&V> {
+    pub fn get(&self, key: &K) -> Option<&AtomicPtr<V>> {
         let mut curr = self.head.load(Ordering::Acquire);
         for i in (0..=self.height()).rev() {
             if unsafe { i < (*curr).height() } {
@@ -207,7 +206,7 @@ where
                             curr = fwd;
                         }
                         std::cmp::Ordering::Equal => {
-                            let val = unsafe { (*fwd).value.as_ref() };
+                            let val = unsafe { (*fwd).value() };
                             return val;
                         }
                         std::cmp::Ordering::Greater => break,
@@ -217,6 +216,42 @@ where
         }
 
         None
+    }
+
+    pub fn get_node_ref(&self, key: &K) -> Option<AtomicPtr<Node<K, V, N>>> {
+        let mut curr = self.head.load(Ordering::Acquire);
+        for i in (0..=self.height()).rev() {
+            if unsafe { i < (*curr).height() } {
+                loop {
+                    let fwd = unsafe { (*curr).forward(i).load(Ordering::Acquire) };
+                    if fwd.is_null() {
+                        break;
+                    };
+
+                    match unsafe { (*fwd).key.cmp(key) } {
+                        std::cmp::Ordering::Less => {
+                            curr = fwd;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            return Some(AtomicPtr::new(fwd));
+                        }
+                        std::cmp::Ordering::Greater => break,
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_and_update<F>(&self, key: &K, f: F) -> Option<&V>
+    where
+        F: Fn(Option<&V>) -> Option<V>,
+    {
+        loop {
+            let old_value = self.get(key);
+            // let new_value = f(old_value);
+            todo!()
+        }
     }
 
     fn random_level(max_level: usize) -> usize {
@@ -243,13 +278,23 @@ mod node_tests {
         assert!(node.value().is_none());
         assert_eq!(node.height(), 5);
         assert_eq!(node.key(), &i32::MIN);
-        let ok = node.forward_insert(Node::<i32, i32, 5>::new(0, Some(1), AtomicUsize::new(1)), 0);
+        let value = AtomicPtr::new(Box::into_raw(Box::new(1)));
+        let ok = node.forward_insert(
+            Node::<i32, i32, 5>::new(0, Some(value), AtomicUsize::new(1)),
+            0,
+        );
         assert!(ok);
         unsafe {
             assert!(!node.forward(0).load(Ordering::Acquire).is_null());
             assert_eq!(
-                node.forward(0).load(Ordering::Acquire).read().value(),
-                Some(&1)
+                node.forward(0)
+                    .load(Ordering::Acquire)
+                    .read()
+                    .value()
+                    .unwrap()
+                    .load(Ordering::Relaxed)
+                    .read(),
+                1
             );
         }
     }
@@ -257,11 +302,9 @@ mod node_tests {
     fn update_node(sl: Arc<Node<u64, u64, 5>>) {
         loop {
             let v = sl.forward(0).load(Ordering::Acquire);
-            let update = Box::into_raw(Box::new(Node::<u64, u64, 5>::new(
-                0u64,
-                unsafe { Option::from(v.read().value.unwrap().saturating_add(1)) },
-                AtomicUsize::new(1),
-            )));
+            if v.is_null() {
+                panic!("shouldn't be null");
+            }
             match sl
                 .forward(0)
                 .compare_exchange(v, update, Ordering::Release, Ordering::Acquire)
@@ -364,14 +407,8 @@ mod skiplist_tests {
                 for i in 1..=10 {
                     if sl.get(&0).is_none() {
                         sl.insert(0, i);
-                        println!(
-                            "thread_id={} inserting={}, new data! Should only see this once",
-                            thread_id, i
-                        );
                     } else {
                         let v = sl.get(&0).unwrap();
-                        println!("thread_id={} get={}", thread_id, v);
-                        println!("thread_id={} inserting={}", thread_id, v + 1);
                         sl.insert(0, v + 1);
                     }
                 }
@@ -397,5 +434,55 @@ mod skiplist_tests {
         for i in 0..100 {
             run_data_race(i);
         }
+    }
+
+    #[test]
+    fn skiplist_node_refs() {
+        let sl = Arc::new(SkipList::<i32, i32, 2>::new());
+        sl.insert(10, 2);
+
+        let v = sl.get_node_ref(&10);
+        assert!(v.is_some());
+        let node = v.unwrap();
+        let ok = unsafe {
+            let expected = node.load(Ordering::Acquire);
+            let new_node = Box::into_raw(Box::new(Node::<i32, i32, 2>::new(
+                (*expected).key,
+                Some(9999),
+                AtomicUsize::new((*expected).height.load(Ordering::Acquire)),
+            )));
+            if !expected.is_null() {
+                match node.compare_exchange(
+                    expected,
+                    new_node,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => true,
+                    Err(_) => {
+                        panic!("should not error")
+                    }
+                }
+            } else {
+                false
+            }
+        };
+        assert!(ok);
+        assert_eq!(sl.get(&10), Some(&9999));
+    }
+
+    #[test]
+    fn skiplist_same_key_insert() {
+        let sl = SkipList::<i32, i32, 3>::new();
+        sl.insert(0, 0);
+        sl.insert(0, 1);
+        sl.insert(0, 2);
+        sl.insert(0, 3);
+        assert_eq!(sl.get(&0), Some(&3));
+        sl.insert(2, 0);
+        sl.insert(2, 1);
+        sl.insert(2, 2);
+        sl.insert(2, 900);
+        assert_eq!(sl.get(&2), Some(&900));
     }
 }
