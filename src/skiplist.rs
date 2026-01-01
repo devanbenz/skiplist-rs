@@ -256,15 +256,27 @@ where
         None
     }
 
-    pub fn get_and_update<F>(&self, _key: &K, _f: F) -> Option<&V>
+    pub fn get_and_update<F>(&self, key: &K, f: F) -> Option<AtomicPtr<V>>
     where
-        F: Fn(Option<&V>) -> Option<V>,
+        F: Fn(Option<&AtomicPtr<V>>) -> AtomicPtr<V>,
     {
-        loop {
-            // let old_value = self.get(key);
-            // let new_value = f(old_value);
-            todo!()
-        }
+        let old_value = self.get(key);
+        let new_value = f(old_value);
+        old_value.map(|old_value| {
+            loop {
+                match old_value.compare_exchange(
+                    old_value.load(Ordering::Acquire),
+                    new_value.load(Ordering::Acquire),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(_) => {}
+                }
+            }
+
+            new_value
+        })
     }
 
     fn random_level(max_level: usize) -> usize {
@@ -312,43 +324,45 @@ mod node_tests {
         }
     }
 
-    //     #[test]
-    //     fn test_node_thread_data_race() {
-    //         let sl = Arc::new(Node::<u64, u64, 5>::new(
-    //             u64::MIN,
-    //             None,
-    //             AtomicUsize::new(5),
-    //         ));
-    //         let mut handles = vec![];
-    //
-    //         for _ in 0..4 {
-    //             let sl = Arc::clone(&sl);
-    //             let handle = thread::spawn(move || {
-    //                 for i in 1..=10 {
-    //                     if sl.forward(0).load(Ordering::Acquire).is_null() {
-    //                         if !sl.forward_insert(
-    //                             Node::<u64, u64, 5>::new(0, Some(i), AtomicUsize::new(1)),
-    //                             0,
-    //                         ) {
-    //                             update_node(Arc::clone(&sl));
-    //                         }
-    //                     } else {
-    //                         update_node(Arc::clone(&sl));
-    //                     }
-    //                 }
-    //             });
-    //             handles.push(handle);
-    //         }
-    //
-    //         for handle in handles {
-    //             handle.join().unwrap();
-    //         }
-    //
-    //         let ptr = sl.forward(0).load(Ordering::Acquire);
-    //         assert!(!ptr.is_null());
-    //         let value = unsafe { ptr.read().value.unwrap().load(Ordering::Relaxed).read() };
-    //         assert_eq!(value, 40);
-    //     }
+    #[test]
+    fn test_node_thread_data_race() {
+        let sl = Arc::new(Node::<u64, u64, 5>::new(
+            u64::MIN,
+            None,
+            AtomicUsize::new(5),
+        ));
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let sl = Arc::clone(&sl);
+            let handle = thread::spawn(move || {
+                for i in 1..=10 {
+                    if sl.forward(0).load(Ordering::Acquire).is_null() {
+                        if !sl.forward_insert(
+                            Node::<u64, u64, 5>::new(0, Some(i), AtomicUsize::new(1)),
+                            0,
+                        ) {
+                            update_node(Arc::clone(&sl));
+                        }
+                    } else {
+                        update_node(Arc::clone(&sl));
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let ptr = sl.forward(0).load(Ordering::Acquire);
+        assert!(!ptr.is_null());
+        let value = unsafe { ptr.read().value.unwrap().load(Ordering::Relaxed).read() };
+        assert_eq!(value, 40);
+    }
+
+    fn update_node(p0: Arc<Node<u64, u64, 5>>) {}
 }
 
 impl Min<i32> for i32 {
