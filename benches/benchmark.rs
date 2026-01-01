@@ -1,6 +1,5 @@
 use skiplist_rs::skiplist;
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -57,7 +56,7 @@ fn lock_free_skiplist_mixed_workload<const THREADS: usize>(bencher: divan::Bench
             // Pre-populate
             {
                 for i in 0..5000 {
-                    map.insert(i, i * 2);
+                    map.insert_raw(i, i * 2);
                 }
             }
             map
@@ -76,7 +75,7 @@ fn lock_free_skiplist_mixed_workload<const THREADS: usize>(bencher: divan::Bench
                         if i % 10 < 7 {
                             divan::black_box(map.get(&(key % 5000)));
                         } else {
-                            map.insert(key + 5000, key * 2);
+                            map.insert_raw(key + 5000, key * 2);
                         }
                     }
                 });

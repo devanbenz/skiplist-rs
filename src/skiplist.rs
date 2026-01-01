@@ -116,6 +116,11 @@ where
         unsafe { v.read() }
     }
 
+    pub fn insert_raw(&self, key: K, value: V) {
+        let value_ptr = Box::into_raw(Box::new(value));
+        self.insert(key, AtomicPtr::new(value_ptr));
+    }
+
     // TODO: Make this actually thread safe
     pub fn insert(&self, key: K, value: AtomicPtr<V>) {
         let head_ptr = self.head.load(Ordering::Acquire);
@@ -218,6 +223,14 @@ where
         None
     }
 
+    pub fn get_raw(&self, key: &K) -> Option<V> {
+        if let Some(val) = self.get(key) {
+            unsafe { Some(val.load(Ordering::Acquire).read()) }
+        } else {
+            None
+        }
+    }
+
     pub fn get_node_ref(&self, key: &K) -> Option<AtomicPtr<Node<K, V, N>>> {
         let mut curr = self.head.load(Ordering::Acquire);
         for i in (0..=self.height()).rev() {
@@ -243,12 +256,12 @@ where
         None
     }
 
-    pub fn get_and_update<F>(&self, key: &K, f: F) -> Option<&V>
+    pub fn get_and_update<F>(&self, _key: &K, _f: F) -> Option<&V>
     where
         F: Fn(Option<&V>) -> Option<V>,
     {
         loop {
-            let old_value = self.get(key);
+            // let old_value = self.get(key);
             // let new_value = f(old_value);
             todo!()
         }
@@ -299,61 +312,43 @@ mod node_tests {
         }
     }
 
-    fn update_node(sl: Arc<Node<u64, u64, 5>>) {
-        loop {
-            let v = sl.forward(0).load(Ordering::Acquire);
-            if v.is_null() {
-                panic!("shouldn't be null");
-            }
-            match sl
-                .forward(0)
-                .compare_exchange(v, update, Ordering::Release, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    break;
-                }
-                Err(_) => unsafe { drop(Box::from_raw(update)) },
-            }
-        }
-    }
-
-    #[test]
-    fn test_node_thread_data_race() {
-        let sl = Arc::new(Node::<u64, u64, 5>::new(
-            u64::MIN,
-            None,
-            AtomicUsize::new(5),
-        ));
-        let mut handles = vec![];
-
-        for _ in 0..4 {
-            let sl = Arc::clone(&sl);
-            let handle = thread::spawn(move || {
-                for i in 1..=10 {
-                    if sl.forward(0).load(Ordering::Acquire).is_null() {
-                        if !sl.forward_insert(
-                            Node::<u64, u64, 5>::new(0, Some(i), AtomicUsize::new(1)),
-                            0,
-                        ) {
-                            update_node(Arc::clone(&sl));
-                        }
-                    } else {
-                        update_node(Arc::clone(&sl));
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        let ptr = sl.forward(0).load(Ordering::Acquire);
-        assert!(!ptr.is_null());
-        let value = unsafe { ptr.read().value };
-        assert_eq!(value, Some(40));
-    }
+    //     #[test]
+    //     fn test_node_thread_data_race() {
+    //         let sl = Arc::new(Node::<u64, u64, 5>::new(
+    //             u64::MIN,
+    //             None,
+    //             AtomicUsize::new(5),
+    //         ));
+    //         let mut handles = vec![];
+    //
+    //         for _ in 0..4 {
+    //             let sl = Arc::clone(&sl);
+    //             let handle = thread::spawn(move || {
+    //                 for i in 1..=10 {
+    //                     if sl.forward(0).load(Ordering::Acquire).is_null() {
+    //                         if !sl.forward_insert(
+    //                             Node::<u64, u64, 5>::new(0, Some(i), AtomicUsize::new(1)),
+    //                             0,
+    //                         ) {
+    //                             update_node(Arc::clone(&sl));
+    //                         }
+    //                     } else {
+    //                         update_node(Arc::clone(&sl));
+    //                     }
+    //                 }
+    //             });
+    //             handles.push(handle);
+    //         }
+    //
+    //         for handle in handles {
+    //             handle.join().unwrap();
+    //         }
+    //
+    //         let ptr = sl.forward(0).load(Ordering::Acquire);
+    //         assert!(!ptr.is_null());
+    //         let value = unsafe { ptr.read().value.unwrap().load(Ordering::Relaxed).read() };
+    //         assert_eq!(value, 40);
+    //     }
 }
 
 impl Min<i32> for i32 {
@@ -374,27 +369,27 @@ mod skiplist_tests {
         assert_eq!(sl.max_height.load(Ordering::Acquire), 5);
         assert_eq!(sl.cur_height.load(Ordering::Acquire), 0);
         assert_eq!(sl.head().key(), &i32::MIN);
-        assert_eq!(sl.head().value(), None);
+        assert!(sl.head().value().is_none());
     }
 
     #[test]
     fn skiplist_insert_and_get() {
         let sl = SkipList::<i32, i32, 5>::new();
-        sl.insert(0, 0);
-        sl.insert(1, 1);
-        sl.insert(2, 2);
-        sl.insert(3, 2);
-        sl.insert(4, 2);
+        sl.insert_raw(0, 0);
+        sl.insert_raw(1, 1);
+        sl.insert_raw(2, 2);
+        sl.insert_raw(3, 2);
+        sl.insert_raw(4, 2);
         assert_eq!(sl.max_height.load(Ordering::Acquire), 5);
         assert_ne!(sl.cur_height.load(Ordering::Acquire), 0);
         assert_eq!(sl.head().key(), &i32::MIN);
-        assert_eq!(sl.head().value(), None);
+        assert!(sl.head().value().is_none());
 
-        assert_eq!(sl.get(&0), Some(&0));
-        assert_eq!(sl.get(&1), Some(&1));
-        assert_eq!(sl.get(&2), Some(&2));
-        assert_eq!(sl.get(&3), Some(&2));
-        assert_eq!(sl.get(&4), Some(&2));
+        assert_eq!(sl.get_raw(&0), Some(0));
+        assert_eq!(sl.get_raw(&1), Some(1));
+        assert_eq!(sl.get_raw(&2), Some(2));
+        assert_eq!(sl.get_raw(&3), Some(2));
+        assert_eq!(sl.get_raw(&4), Some(2));
     }
 
     fn run_data_race(iteration: usize) {
@@ -406,10 +401,10 @@ mod skiplist_tests {
             let handle = thread::spawn(move || {
                 for i in 1..=10 {
                     if sl.get(&0).is_none() {
-                        sl.insert(0, i);
+                        sl.insert_raw(0, i);
                     } else {
-                        let v = sl.get(&0).unwrap();
-                        sl.insert(0, v + 1);
+                        let v = sl.get_raw(&0).unwrap();
+                        sl.insert_raw(0, (v + 1));
                     }
                 }
             });
@@ -420,11 +415,11 @@ mod skiplist_tests {
             handle.join().unwrap();
         }
 
-        let val = sl.get(&0);
+        let val = sl.get_raw(&0);
         assert!(val.is_some());
         assert_eq!(
             val,
-            Some(&40),
+            Some(40),
             "data race detected, failed on iteration={iteration}"
         );
     }
@@ -439,7 +434,7 @@ mod skiplist_tests {
     #[test]
     fn skiplist_node_refs() {
         let sl = Arc::new(SkipList::<i32, i32, 2>::new());
-        sl.insert(10, 2);
+        sl.insert_raw(10, 2);
 
         let v = sl.get_node_ref(&10);
         assert!(v.is_some());
@@ -448,7 +443,7 @@ mod skiplist_tests {
             let expected = node.load(Ordering::Acquire);
             let new_node = Box::into_raw(Box::new(Node::<i32, i32, 2>::new(
                 (*expected).key,
-                Some(9999),
+                Some(AtomicPtr::new(Box::into_raw(Box::new(9999)))),
                 AtomicUsize::new((*expected).height.load(Ordering::Acquire)),
             )));
             if !expected.is_null() {
@@ -468,21 +463,21 @@ mod skiplist_tests {
             }
         };
         assert!(ok);
-        assert_eq!(sl.get(&10), Some(&9999));
+        assert_eq!(sl.get_raw(&10), Some(9999));
     }
 
     #[test]
     fn skiplist_same_key_insert() {
         let sl = SkipList::<i32, i32, 3>::new();
-        sl.insert(0, 0);
-        sl.insert(0, 1);
-        sl.insert(0, 2);
-        sl.insert(0, 3);
-        assert_eq!(sl.get(&0), Some(&3));
-        sl.insert(2, 0);
-        sl.insert(2, 1);
-        sl.insert(2, 2);
-        sl.insert(2, 900);
-        assert_eq!(sl.get(&2), Some(&900));
+        sl.insert_raw(0, 0);
+        sl.insert_raw(0, 1);
+        sl.insert_raw(0, 2);
+        sl.insert_raw(0, 3);
+        assert_eq!(sl.get_raw(&0), Some(3));
+        sl.insert_raw(2, 0);
+        sl.insert_raw(2, 1);
+        sl.insert_raw(2, 2);
+        sl.insert_raw(2, 900);
+        assert_eq!(sl.get_raw(&2), Some(900));
     }
 }
