@@ -56,7 +56,7 @@ fn lock_free_skiplist_mixed_workload<const THREADS: usize>(bencher: divan::Bench
             // Pre-populate
             {
                 for i in 0..5000 {
-                    map.insert_raw(i, i * 2);
+                    map.insert(i, i * 2);
                 }
             }
             map
@@ -73,9 +73,9 @@ fn lock_free_skiplist_mixed_workload<const THREADS: usize>(bencher: divan::Bench
 
                         // 70% reads, 30% writes
                         if i % 10 < 7 {
-                            divan::black_box(map.get(&(key % 5000)));
+                            divan::black_box(map.get_inner(&(key % 5000)));
                         } else {
-                            map.insert_raw(key + 5000, key * 2);
+                            map.insert(key + 5000, key * 2);
                         }
                     }
                 });

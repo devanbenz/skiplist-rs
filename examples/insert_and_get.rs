@@ -6,11 +6,11 @@ fn main() {
     for i in 0..10_000 {
         println!("iteration {}", i);
         let value = AtomicPtr::new(Box::into_raw(Box::new(i)));
-        sl.insert(i, value);
+        sl.insert_inner(i, value);
     }
 
     for i in 0..10_000 {
-        let v = sl.get(&i);
+        let v = sl.get_inner(&i);
         println!("{:?}", v);
     }
 }

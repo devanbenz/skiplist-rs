@@ -58,6 +58,35 @@ impl<K, V, const N: usize> Node<K, V, N> {
         self.value.as_ref()
     }
 
+    pub fn get_and_set_value<F>(&self, f: F) -> Option<&AtomicPtr<V>>
+    where
+        F: Fn(V) -> V,
+    {
+        if let Some(value) = self.value.as_ref() {
+            let _ = self.value.as_ref().is_some_and(|internal| {
+                loop {
+                    let ptr = value.load(Ordering::Acquire);
+                    let new_v = Box::into_raw(Box::new(f(unsafe { ptr.read() })));
+                    match internal.compare_exchange(
+                        ptr,
+                        new_v,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(_) => {
+                            drop(unsafe { Box::from_raw(new_v) });
+                        }
+                    }
+                }
+                return true;
+            });
+            self.value.as_ref()
+        } else {
+            None
+        }
+    }
+
     pub fn forward(&self, index: usize) -> &AtomicPtr<Node<K, V, N>> {
         if index > N {
             panic!("index out of bounds");
@@ -116,13 +145,13 @@ where
         unsafe { v.read() }
     }
 
-    pub fn insert_raw(&self, key: K, value: V) {
+    pub fn insert(&self, key: K, value: V) {
         let value_ptr = Box::into_raw(Box::new(value));
-        self.insert(key, AtomicPtr::new(value_ptr));
+        self.insert_inner(key, AtomicPtr::new(value_ptr));
     }
 
     // TODO: Make this actually thread safe
-    pub fn insert(&self, key: K, value: AtomicPtr<V>) {
+    pub fn insert_inner(&self, key: K, value: AtomicPtr<V>) {
         let head_ptr = self.head.load(Ordering::Acquire);
         let mut curr_ptr = head_ptr;
         let mut update: [*mut Node<K, V, N>; N] = [std::ptr::null_mut(); N];
@@ -155,7 +184,10 @@ where
         let next = unsafe { (*curr_ptr).forward(0).load(Ordering::Acquire) };
         if !next.is_null() && unsafe { (*next).key() == &key } {
             unsafe {
-                (*next).value = Some(value);
+                (*next).get_and_set_value(|mut v| {
+                    v = value.load(Ordering::Acquire).read();
+                    v
+                });
             }
             return;
         }
@@ -196,7 +228,15 @@ where
         }
     }
 
-    pub fn get(&self, key: &K) -> Option<&AtomicPtr<V>> {
+    pub fn get(&self, key: &K) -> Option<V> {
+        if let Some(val) = self.get_inner(key) {
+            unsafe { Some(val.load(Ordering::Acquire).read()) }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_inner(&self, key: &K) -> Option<&AtomicPtr<V>> {
         let mut curr = self.head.load(Ordering::Acquire);
         for i in (0..=self.height()).rev() {
             if unsafe { i < (*curr).height() } {
@@ -221,14 +261,6 @@ where
         }
 
         None
-    }
-
-    pub fn get_raw(&self, key: &K) -> Option<V> {
-        if let Some(val) = self.get(key) {
-            unsafe { Some(val.load(Ordering::Acquire).read()) }
-        } else {
-            None
-        }
     }
 
     pub fn get_node_ref(&self, key: &K) -> Option<AtomicPtr<Node<K, V, N>>> {
@@ -260,7 +292,7 @@ where
     where
         F: Fn(Option<&AtomicPtr<V>>) -> AtomicPtr<V>,
     {
-        let old_value = self.get(key);
+        let old_value = self.get_inner(key);
         let new_value = f(old_value);
         old_value.map(|old_value| {
             loop {
@@ -324,6 +356,10 @@ mod node_tests {
         }
     }
 
+    fn add_one(i: u64) -> u64 {
+        i.saturating_add(1)
+    }
+
     #[test]
     fn test_node_thread_data_race() {
         let sl = Arc::new(Node::<u64, u64, 5>::new(
@@ -336,16 +372,24 @@ mod node_tests {
         for _ in 0..4 {
             let sl = Arc::clone(&sl);
             let handle = thread::spawn(move || {
-                for i in 1..=10 {
+                for _ in 1..=10 {
                     if sl.forward(0).load(Ordering::Acquire).is_null() {
                         if !sl.forward_insert(
-                            Node::<u64, u64, 5>::new(0, Some(i), AtomicUsize::new(1)),
+                            Node::<u64, u64, 5>::new(
+                                u64::MIN,
+                                Some(AtomicPtr::new(Box::into_raw(Box::new(0)))),
+                                AtomicUsize::new(1),
+                            ),
                             0,
                         ) {
-                            update_node(Arc::clone(&sl));
+                            unsafe {
+                                (*sl.forward(0).load(Ordering::Acquire)).get_and_set_value(add_one);
+                            }
                         }
                     } else {
-                        update_node(Arc::clone(&sl));
+                        unsafe {
+                            (*sl.forward(0).load(Ordering::Acquire)).get_and_set_value(add_one);
+                        }
                     }
                 }
             });
@@ -359,10 +403,8 @@ mod node_tests {
         let ptr = sl.forward(0).load(Ordering::Acquire);
         assert!(!ptr.is_null());
         let value = unsafe { ptr.read().value.unwrap().load(Ordering::Relaxed).read() };
-        assert_eq!(value, 40);
+        assert_eq!(value, 39);
     }
-
-    fn update_node(p0: Arc<Node<u64, u64, 5>>) {}
 }
 
 impl Min<i32> for i32 {
@@ -389,21 +431,21 @@ mod skiplist_tests {
     #[test]
     fn skiplist_insert_and_get() {
         let sl = SkipList::<i32, i32, 5>::new();
-        sl.insert_raw(0, 0);
-        sl.insert_raw(1, 1);
-        sl.insert_raw(2, 2);
-        sl.insert_raw(3, 2);
-        sl.insert_raw(4, 2);
+        sl.insert(0, 0);
+        sl.insert(1, 1);
+        sl.insert(2, 2);
+        sl.insert(3, 2);
+        sl.insert(4, 2);
         assert_eq!(sl.max_height.load(Ordering::Acquire), 5);
         assert_ne!(sl.cur_height.load(Ordering::Acquire), 0);
         assert_eq!(sl.head().key(), &i32::MIN);
         assert!(sl.head().value().is_none());
 
-        assert_eq!(sl.get_raw(&0), Some(0));
-        assert_eq!(sl.get_raw(&1), Some(1));
-        assert_eq!(sl.get_raw(&2), Some(2));
-        assert_eq!(sl.get_raw(&3), Some(2));
-        assert_eq!(sl.get_raw(&4), Some(2));
+        assert_eq!(sl.get(&0), Some(0));
+        assert_eq!(sl.get(&1), Some(1));
+        assert_eq!(sl.get(&2), Some(2));
+        assert_eq!(sl.get(&3), Some(2));
+        assert_eq!(sl.get(&4), Some(2));
     }
 
     fn run_data_race(iteration: usize) {
@@ -414,11 +456,11 @@ mod skiplist_tests {
             let sl = Arc::clone(&sl);
             let handle = thread::spawn(move || {
                 for i in 1..=10 {
-                    if sl.get(&0).is_none() {
-                        sl.insert_raw(0, i);
+                    if sl.get_inner(&0).is_none() {
+                        sl.insert(0, i);
                     } else {
-                        let v = sl.get_raw(&0).unwrap();
-                        sl.insert_raw(0, (v + 1));
+                        let v = sl.get(&0).unwrap();
+                        sl.insert(0, (v + 1));
                     }
                 }
             });
@@ -429,7 +471,7 @@ mod skiplist_tests {
             handle.join().unwrap();
         }
 
-        let val = sl.get_raw(&0);
+        let val = sl.get(&0);
         assert!(val.is_some());
         assert_eq!(
             val,
@@ -448,7 +490,7 @@ mod skiplist_tests {
     #[test]
     fn skiplist_node_refs() {
         let sl = Arc::new(SkipList::<i32, i32, 2>::new());
-        sl.insert_raw(10, 2);
+        sl.insert(10, 2);
 
         let v = sl.get_node_ref(&10);
         assert!(v.is_some());
@@ -477,21 +519,21 @@ mod skiplist_tests {
             }
         };
         assert!(ok);
-        assert_eq!(sl.get_raw(&10), Some(9999));
+        assert_eq!(sl.get(&10), Some(9999));
     }
 
     #[test]
     fn skiplist_same_key_insert() {
         let sl = SkipList::<i32, i32, 3>::new();
-        sl.insert_raw(0, 0);
-        sl.insert_raw(0, 1);
-        sl.insert_raw(0, 2);
-        sl.insert_raw(0, 3);
-        assert_eq!(sl.get_raw(&0), Some(3));
-        sl.insert_raw(2, 0);
-        sl.insert_raw(2, 1);
-        sl.insert_raw(2, 2);
-        sl.insert_raw(2, 900);
-        assert_eq!(sl.get_raw(&2), Some(900));
+        sl.insert(0, 0);
+        sl.insert(0, 1);
+        sl.insert(0, 2);
+        sl.insert(0, 3);
+        assert_eq!(sl.get(&0), Some(3));
+        sl.insert(2, 0);
+        sl.insert(2, 1);
+        sl.insert(2, 2);
+        sl.insert(2, 900);
+        assert_eq!(sl.get(&2), Some(900));
     }
 }
