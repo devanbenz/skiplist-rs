@@ -58,32 +58,26 @@ impl<K, V, const N: usize> Node<K, V, N> {
         self.value.as_ref()
     }
 
-    pub fn get_and_set_value<F>(&self, f: F) -> Option<&AtomicPtr<V>>
+    pub fn set_value<F>(&self, f: F)
     where
-        F: Fn(V) -> V,
+        F: Fn(&mut V) -> V,
     {
         if let Some(value) = self.value.as_ref() {
-            let _ = self.value.as_ref().is_some_and(|internal| {
-                loop {
-                    let ptr = value.load(Ordering::Acquire);
-                    let new_v = Box::into_raw(Box::new(f(unsafe { ptr.read() })));
-                    match internal.compare_exchange(
-                        ptr,
-                        new_v,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(_) => {
-                            drop(unsafe { Box::from_raw(new_v) });
-                        }
-                    }
-                }
-                return true;
-            });
-            self.value.as_ref()
-        } else {
-            None
+            let new_val = value
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    f(unsafe { &mut *v });
+                    Some(v)
+                })
+                .expect("could not update value");
+            let ok = match value.compare_exchange(
+                value.load(Ordering::Acquire),
+                new_val,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {}
+                Err(_) => {}
+            };
         }
     }
 
@@ -185,8 +179,8 @@ where
         if !next.is_null() && unsafe { (*next).key() == &key } {
             unsafe {
                 (*next).get_and_set_value(|mut v| {
-                    v = value.load(Ordering::Acquire).read();
-                    v
+                    v = &mut *value.load(Ordering::Acquire);
+                    return *v;
                 });
             }
             return;
@@ -356,7 +350,7 @@ mod node_tests {
         }
     }
 
-    fn add_one(i: u64) -> u64 {
+    fn add_one(i: &mut u64) -> u64 {
         i.saturating_add(1)
     }
 
@@ -495,30 +489,11 @@ mod skiplist_tests {
         let v = sl.get_node_ref(&10);
         assert!(v.is_some());
         let node = v.unwrap();
-        let ok = unsafe {
-            let expected = node.load(Ordering::Acquire);
-            let new_node = Box::into_raw(Box::new(Node::<i32, i32, 2>::new(
-                (*expected).key,
-                Some(AtomicPtr::new(Box::into_raw(Box::new(9999)))),
-                AtomicUsize::new((*expected).height.load(Ordering::Acquire)),
-            )));
-            if !expected.is_null() {
-                match node.compare_exchange(
-                    expected,
-                    new_node,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => true,
-                    Err(_) => {
-                        panic!("should not error")
-                    }
-                }
-            } else {
-                false
-            }
-        };
-        assert!(ok);
+        let expected = node.load(Ordering::Acquire);
+        let ret = (unsafe { *expected }).get_and_set_value(|mut v| {
+            v = &mut 9999;
+            return *v;
+        });
         assert_eq!(sl.get(&10), Some(9999));
     }
 
