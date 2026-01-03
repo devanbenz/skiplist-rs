@@ -178,7 +178,7 @@ where
         let next = unsafe { (*curr_ptr).forward(0).load(Ordering::Acquire) };
         if !next.is_null() && unsafe { (*next).key() == &key } {
             unsafe {
-                (*next).get_and_set_value(|mut v| {
+                (*next).set_value(|mut v| {
                     v = &mut *value.load(Ordering::Acquire);
                     return *v;
                 });
@@ -377,12 +377,12 @@ mod node_tests {
                             0,
                         ) {
                             unsafe {
-                                (*sl.forward(0).load(Ordering::Acquire)).get_and_set_value(add_one);
+                                (*sl.forward(0).load(Ordering::Acquire)).set_value(add_one);
                             }
                         }
                     } else {
                         unsafe {
-                            (*sl.forward(0).load(Ordering::Acquire)).get_and_set_value(add_one);
+                            (*sl.forward(0).load(Ordering::Acquire)).set_value(add_one);
                         }
                     }
                 }
@@ -489,11 +489,12 @@ mod skiplist_tests {
         let v = sl.get_node_ref(&10);
         assert!(v.is_some());
         let node = v.unwrap();
-        let expected = node.load(Ordering::Acquire);
-        let ret = (unsafe { *expected }).get_and_set_value(|mut v| {
-            v = &mut 9999;
-            return *v;
-        });
+        let ret = unsafe { node.load(Ordering::Acquire).as_mut() }
+            .unwrap()
+            .set_value(|mut v| {
+                let _ = std::mem::replace(v, 9999);
+                return *v;
+            });
         assert_eq!(sl.get(&10), Some(9999));
     }
 
