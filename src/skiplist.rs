@@ -23,7 +23,7 @@ pub struct Node<K, V, const N: usize> {
 impl<K, V, const N: usize> Node<K, V, N> {
     pub fn new(key: K, value: Option<Arc<AtomicPtr<V>>>, height: AtomicUsize) -> Self {
         let forward: [AtomicPtr<Node<K, V, N>>; N] =
-            std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut()));
+            std::array::from_fn(|_| AtomicPtr::new(null_mut()));
         Self {
             key,
             value,
@@ -37,7 +37,7 @@ impl<K, V, const N: usize> Node<K, V, N> {
     pub fn forward_insert(&self, value: Node<K, V, N>, index: usize) -> bool {
         let ptr = Box::into_raw(Box::new(value));
         match self.forward[index].compare_exchange(
-            std::ptr::null_mut(),
+            null_mut(),
             ptr,
             Ordering::Release,
             Ordering::Relaxed,
@@ -98,10 +98,10 @@ where
 impl<K, V, const N: usize> SkipList<K, V, N>
 where
     K: Min<K> + PartialOrd<K> + Eq + Ord + Copy,
-    V: Copy + std::cmp::PartialEq,
+    V: Copy + PartialEq,
 {
     pub fn new() -> Self {
-        let node_ptr: AtomicPtr<Node<K, V, N>> = AtomicPtr::new(std::ptr::null_mut());
+        let node_ptr: AtomicPtr<Node<K, V, N>> = AtomicPtr::new(null_mut());
         let new_node = Box::into_raw(Box::new(Node::<K, V, N>::new(
             <K as Min<K>>::min(),
             None,
@@ -132,9 +132,6 @@ where
         unsafe { v.read() }
     }
 
-    /// Insert a key-value pair into the skip list.
-    /// Returns: Ok(true) if a new node was created, Ok(false) if existing node was updated,
-    /// Err(()) if concurrent modification was detected (caller should retry).
     pub fn insert(&self, key: K, value: V) -> Result<bool, ()> {
         let value_ptr = Box::into_raw(Box::new(value));
         self.insert_inner(key, Arc::from(AtomicPtr::new(value_ptr)))
@@ -174,19 +171,17 @@ where
             unsafe {
                 let next_ptr = (*curr_ptr).forward(0).load(Ordering::Acquire);
                 if !next_ptr.is_null() && (*next_ptr).key() == &key {
-                    // Always replace with the new value, unconditionally
-                    // This ensures the caller's new value is written
+                    // Always replace with the new value
                     let new_value_arc = Arc::clone(&value);
-                    match (*next_ptr).set_value(move |_old_val| {
+                    return match (*next_ptr).set_value(move |_old_val| {
                         Some(new_value_arc.clone().load(Ordering::Acquire).read())
                     }) {
-                        Ok(_) => return Ok(false),
+                        Ok(_) => Ok(false),
                         Err(e) => {
                             drop(Box::from_raw(e));
-                            // Concurrent modification detected, return error to caller
-                            return Err(());
+                            Err(())
                         }
-                    }
+                    };
                 }
             }
 
@@ -202,7 +197,7 @@ where
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {}
-                    Err(_) => continue 'outer, // Retry if height was changed concurrently
+                    Err(_) => continue 'outer,
                 }
             }
 
@@ -212,7 +207,6 @@ where
                 Some(v),
                 AtomicUsize::from(lvl + 1),
             )));
-            // Insert from highest to lowest level so node becomes visible only when fully inserted
             for i in (0..=lvl).rev() {
                 unsafe {
                     let update_ptr = update[i];
@@ -230,14 +224,12 @@ where
                         Ok(_) => {}
                         Err(_) => {
                             // TODO: Implement proper cleanup or change algorithm to avoid partial insertions
-                            panic!(
-                                "Concurrent modification during insertion - partial insertion would leak memory"
-                            );
+                            panic!("partial insertion");
                         }
                     }
                 }
             }
-            return Ok(true); // Created new node
+            return Ok(true);
         }
     }
 
