@@ -1,4 +1,4 @@
-use crossbeam_epoch::{self as epoch, Atomic, Shared};
+use crossbeam_epoch::{self as epoch, Atomic, Guard, Shared, unprotected};
 use std::fmt::{Debug, Display};
 use std::iter::Skip;
 use std::ops::Deref;
@@ -75,13 +75,13 @@ where
 
 impl<K, V, const N: usize> Skiplist<K, V, N>
 where
-    K: Min<K> + std::cmp::PartialOrd,
+    K: Min<K> + PartialOrd + Ord,
 {
     pub fn new() -> Self {
         Self {
             cur_level: AtomicUsize::new(0),
             max_level: N,
-            head: Atomic::new(Node::new(K::min(), None, N)),
+            head: Atomic::new(Node::new(<K as Min<K>>::min(), None, N)),
         }
     }
 
@@ -154,6 +154,41 @@ where
         }
     }
 
+    pub fn get<'a>(&self, key: &K, guard: &'a Guard) -> Option<&'a V>
+    where
+        K: 'a,
+    {
+        let curr = self.head.load(Ordering::SeqCst, guard);
+        let mut curr_node = unsafe { curr.deref() };
+        let curr_level = self.cur_level.load(Ordering::SeqCst);
+        for i in (0..=curr_level).rev() {
+            if i < curr_level {
+                loop {
+                    if let Some(fwd) = curr_node.forward.get(i) {
+                        let fwd_raw = fwd.load(Ordering::SeqCst, guard);
+                        if fwd_raw.is_null() {
+                            break;
+                        }
+                        let fwd_node = unsafe { fwd_raw.deref() };
+
+                        match fwd_node.key.cmp(key) {
+                            std::cmp::Ordering::Less => {
+                                curr_node = fwd_node;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                if let Some(v) = &fwd_node.value {
+                                    return Some(v);
+                                }
+                            }
+                            std::cmp::Ordering::Greater => break,
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn random_level(max_level: usize) -> usize {
         use rand::Rng;
         let mut rng = rand::rng();
@@ -171,4 +206,15 @@ fn main() {
     println!("before: {}", skiplist);
     skiplist.insert(1, 4);
     println!("after: {}", skiplist);
+    skiplist.insert(2, 5);
+    skiplist.insert(3, 7);
+    skiplist.insert(5, 8);
+    skiplist.insert(9, 12);
+    skiplist.insert(0, 19);
+    println!("final: {}", skiplist);
+    let guard = &epoch::pin();
+    let v = skiplist.get(&9, guard);
+    assert!(v.is_some());
+    assert_eq!(v.unwrap(), &12);
+    println!("Found data: key=9; value={}", v.unwrap());
 }
