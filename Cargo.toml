@@ -7,6 +7,7 @@ edition = "2024"
 crossbeam-epoch = "0.9.18"
 rand = "0.9.2"
 divan = "0.1.21"
+skiplist-rs = "0.1.5"
 
 [[bench]]
 name = "benchmark"

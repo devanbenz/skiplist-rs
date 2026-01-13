@@ -1,4 +1,3 @@
-use skiplist_rs::skiplist;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -52,7 +51,7 @@ fn btreemap_mixed_workload<const THREADS: usize>(bencher: divan::Bencher) {
 fn lock_free_skiplist_mixed_workload<const THREADS: usize>(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| {
-            let map = Arc::new(skiplist::Skiplist::<u64, u64, 5>::new());
+            let map = Arc::new(ibis_skiplist::skiplist::Skiplist::<u64, u64, 5>::new());
             // Pre-populate
             {
                 for i in 0..5000 {

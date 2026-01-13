@@ -1,4 +1,4 @@
-use skiplist_rs::skiplist::Skiplist;
+use ibis_skiplist::skiplist::Skiplist;
 
 fn main() {
     let sl = Skiplist::<i32, i32, 6>::new();
