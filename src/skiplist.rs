@@ -18,6 +18,12 @@ impl Min<u64> for u64 {
     }
 }
 
+impl Min<usize> for usize {
+    fn min() -> usize {
+        usize::MIN
+    }
+}
+
 struct Node<K, V, const N: usize> {
     key: K,
     value: Atomic<Option<Box<V>>>,
