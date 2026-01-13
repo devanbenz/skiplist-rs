@@ -17,8 +17,10 @@ fn main() {
         sl.insert(i, i);
     }
 
+    // TODO: Remove guard parameter
+    let guard = &crossbeam_epoch::pin();
     for i in 0..10_000 {
-        let v = sl.get(&i);
+        let v = sl.get(&i, guard);
         println!("{:?}", v);
     }
 }

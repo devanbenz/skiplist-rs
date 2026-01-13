@@ -3,10 +3,15 @@ name = "skiplist-rs"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+loom = ["dep:loom"]
+
 [dependencies]
 crossbeam-epoch = "0.9.18"
 rand = "0.9.2"
 divan = "0.1.21"
+loom = { version = "0.7", optional = true }
 
 [[bench]]
 name = "benchmark"

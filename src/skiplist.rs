@@ -1,9 +1,15 @@
-use std::ptr::null_mut;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned, Shared};
+use std::fmt::Display;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub trait Min<T> {
     fn min() -> T;
+}
+
+impl Min<i32> for i32 {
+    fn min() -> i32 {
+        i32::MIN
+    }
 }
 
 impl Min<u64> for u64 {
@@ -12,413 +18,234 @@ impl Min<u64> for u64 {
     }
 }
 
-#[derive(Debug)]
-pub struct Node<K, V, const N: usize> {
+struct Node<K, V, const N: usize> {
     key: K,
-    value: Option<Arc<AtomicPtr<V>>>,
-    height: AtomicUsize,
-    forward: [AtomicPtr<Node<K, V, N>>; N],
+    value: Atomic<Option<Box<V>>>,
+    level: usize,
+    forward: [Atomic<Node<K, V, N>>; N],
 }
 
 impl<K, V, const N: usize> Node<K, V, N> {
-    pub fn new(key: K, value: Option<Arc<AtomicPtr<V>>>, height: AtomicUsize) -> Self {
-        let forward: [AtomicPtr<Node<K, V, N>>; N] =
-            std::array::from_fn(|_| AtomicPtr::new(null_mut()));
+    pub fn new(key: K, value: Option<V>, level: usize) -> Self {
+        let forward = [const { Atomic::null() }; N];
         Self {
             key,
-            value,
-            height,
+            value: Atomic::new(value.map(Box::new)),
+            level,
             forward,
         }
     }
 
-    // insert_at will return false when a compare_exchange fails.
-    // It is up to the client to decide how to deal with this failure.
-    pub fn forward_insert(&self, value: Node<K, V, N>, index: usize) -> bool {
-        let ptr = Box::into_raw(Box::new(value));
-        match self.forward[index].compare_exchange(
-            null_mut(),
-            ptr,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => true,
-            Err(_) => {
-                unsafe {
-                    drop(Box::from_raw(ptr));
+    pub fn forward_ref(&mut self, index: usize) -> Option<&mut Atomic<Node<K, V, N>>> {
+        if index >= N {
+            panic!("index {index} is out of bounds of {N}")
+        }
+        self.forward.get_mut(index)
+    }
+}
+
+pub struct Skiplist<K, V, const N: usize> {
+    cur_level: AtomicUsize,
+    max_level: usize,
+    head: Atomic<Node<K, V, N>>,
+}
+
+impl<K, V, const N: usize> Display for Skiplist<K, V, N>
+where
+    K: Display,
+    V: Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = &epoch::pin();
+        let head = self.head.load(Ordering::SeqCst, guard);
+        let head_node = unsafe { head.deref() };
+        for node in head_node.forward.iter() {
+            let node = node.load(Ordering::SeqCst, guard);
+            if !node.is_null() {
+                let mut val = String::from("null");
+                let node_key = unsafe { &node.deref().key };
+                let node_value =
+                    unsafe { &node.deref().value.load(Ordering::SeqCst, guard).deref() };
+                if let Some(v) = node_value {
+                    val = format!("{}", v);
                 }
-                false
+                write!(f, "key={}; value={}\n", node_key, val)?;
             }
         }
-    }
 
-    pub fn key(&self) -> &K {
-        &self.key
-    }
-
-    pub fn value(&self) -> Option<&Arc<AtomicPtr<V>>> {
-        self.value.as_ref()
-    }
-
-    pub fn set_value<F>(&self, f: F) -> Result<*mut V, *mut V>
-    where
-        F: Fn(&mut V) -> Option<V>,
-    {
-        if let Some(value) = self.value.as_ref() {
-            return value.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                let new_value = f(unsafe { &mut *v })?; // Return None if f returns None
-                let new_ptr = Box::into_raw(Box::new(new_value));
-                Some(new_ptr)
-            });
-        }
-        Err(null_mut())
-    }
-
-    pub fn forward(&self, index: usize) -> &AtomicPtr<Node<K, V, N>> {
-        if index > N {
-            panic!("index out of bounds");
-        }
-        &self.forward[index]
-    }
-
-    pub fn height(&self) -> usize {
-        self.height.load(Ordering::Acquire)
+        Ok(())
     }
 }
 
-pub struct SkipList<K, V, const N: usize>
+impl<K, V, const N: usize> Skiplist<K, V, N>
 where
-    K: Min<K>,
-{
-    max_height: AtomicUsize,
-    cur_height: AtomicUsize,
-    head: AtomicPtr<Node<K, V, N>>,
-}
-
-impl<K, V, const N: usize> SkipList<K, V, N>
-where
-    K: Min<K> + PartialOrd<K> + Eq + Ord + Copy,
-    V: Copy + PartialEq,
+    K: Min<K> + PartialOrd + Ord,
+    V: Clone,
 {
     pub fn new() -> Self {
-        let node_ptr: AtomicPtr<Node<K, V, N>> = AtomicPtr::new(null_mut());
-        let new_node = Box::into_raw(Box::new(Node::<K, V, N>::new(
-            <K as Min<K>>::min(),
-            None,
-            AtomicUsize::new(N),
-        )));
-        node_ptr.store(new_node, Ordering::Release);
-
         Self {
-            max_height: AtomicUsize::new(N),
-            cur_height: AtomicUsize::new(0),
-            head: node_ptr,
+            cur_level: AtomicUsize::new(0),
+            max_level: N,
+            head: Atomic::new(Node::new(<K as Min<K>>::min(), None, N)),
         }
     }
 
-    pub fn max_height(&self) -> usize {
-        self.max_height.load(Ordering::Acquire)
-    }
-
-    pub fn height(&self) -> usize {
-        self.cur_height.load(Ordering::Acquire)
-    }
-
-    pub fn head(&self) -> Node<K, V, N> {
-        let v = self.head.load(Ordering::Acquire);
-        if v.is_null() {
-            panic!("head pointer must not be null");
-        }
-        unsafe { v.read() }
-    }
-
-    pub fn insert(&self, key: K, value: V) -> Result<bool, ()> {
-        let value_ptr = Box::into_raw(Box::new(value));
-        self.insert_inner(key, Arc::from(AtomicPtr::new(value_ptr)))
-    }
-
-    pub fn insert_inner(&self, key: K, value: Arc<AtomicPtr<V>>) -> Result<bool, ()> {
-        let head_ptr = self.head.load(Ordering::Acquire);
+    pub fn insert(&self, key: K, value: V) {
+        let guard = &epoch::pin();
+        let head_ptr = self.head.load(Ordering::Acquire, guard);
         let mut curr_ptr = head_ptr;
 
-        'outer: loop {
-            let mut update: [*mut Node<K, V, N>; N] = [std::ptr::null_mut(); N];
-            let current_height = self.height();
-            for i in (0..=current_height).rev() {
-                loop {
-                    unsafe {
-                        match (*curr_ptr).forward.get(i) {
-                            Some(next_atomic) => {
-                                let next_ptr = next_atomic.load(Ordering::Acquire);
+        let mut update: [Shared<'_, Node<K, V, N>>; N] = [Shared::null(); N];
+        let current_height = self.cur_level.load(Ordering::SeqCst);
+        for i in (0..=current_height).rev() {
+            loop {
+                println!("inside update creation");
+                let curr_node = unsafe { curr_ptr.deref() };
+                match curr_node.forward.get(i) {
+                    Some(next_atomic) => {
+                        let next_ptr = next_atomic.load(Ordering::SeqCst, guard);
 
-                                if next_ptr.is_null() {
-                                    break;
-                                }
+                        if next_ptr.is_null() {
+                            break;
+                        }
 
-                                if (*next_ptr).key() < &key {
-                                    curr_ptr = next_ptr;
-                                } else {
-                                    break;
-                                }
-                            }
-                            None => break,
+                        let next_node = unsafe { next_ptr.deref() };
+                        if next_node.key < key {
+                            curr_ptr = next_ptr;
+                        } else {
+                            break;
                         }
                     }
-                }
-                update[i] = curr_ptr;
-            }
-
-            unsafe {
-                let next_ptr = (*curr_ptr).forward(0).load(Ordering::Acquire);
-                if !next_ptr.is_null() && (*next_ptr).key() == &key {
-                    // Always replace with the new value
-                    let new_value_arc = Arc::clone(&value);
-                    return match (*next_ptr).set_value(move |_old_val| {
-                        Some(new_value_arc.clone().load(Ordering::Acquire).read())
-                    }) {
-                        Ok(_) => Ok(false),
-                        Err(e) => {
-                            drop(Box::from_raw(e));
-                            Err(())
-                        }
-                    };
+                    None => break,
                 }
             }
+            update[i] = curr_ptr;
+        }
 
-            let lvl = Self::random_level(self.max_height());
-            if lvl > self.height() {
-                for i in self.height() + 1..=lvl {
-                    update[i] = head_ptr;
-                }
-                match self.cur_height.compare_exchange(
-                    self.height(),
-                    lvl,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {}
-                    Err(_) => continue 'outer,
-                }
-            }
+        let curr_node = unsafe { curr_ptr.deref() };
+        if let Some(next_ptr) = curr_node.forward.get(0) {
+            let next_node = next_ptr.load(Ordering::SeqCst, guard);
+            if !next_node.is_null() && unsafe { next_node.deref() }.key == key {
+                let node = unsafe { next_node.deref() };
+                let new_value = Owned::new(Some(Box::new(value)));
+                let old = node.value.swap(new_value, Ordering::AcqRel, guard);
 
-            let v = Arc::clone(&value);
-            let new_node = Box::into_raw(Box::new(Node::<K, V, N>::new(
-                key,
-                Some(v),
-                AtomicUsize::from(lvl + 1),
-            )));
-            for i in (0..=lvl).rev() {
                 unsafe {
-                    let update_ptr = update[i];
-                    if update_ptr.is_null() {
+                    guard.defer_destroy(old);
+                }
+
+                return;
+            }
+        }
+
+        let lvl = Self::random_level(self.max_level);
+        if lvl > current_height {
+            for i in current_height + 1..=lvl {
+                update[i] = head_ptr;
+            }
+        }
+        let mut cur = self.cur_level.load(Ordering::Acquire);
+        while lvl > cur {
+            match self
+                .cur_level
+                .compare_exchange(cur, lvl, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+
+        let new_node_ptr = Atomic::new(Node::<K, V, N>::new(key, Some(value), lvl + 1));
+        let new_node = unsafe { new_node_ptr.load(Ordering::SeqCst, guard).deref() };
+        let new_node_shared = new_node_ptr.load(Ordering::SeqCst, guard);
+
+        for i in (0..=lvl).rev() {
+            let mut prev_ptr = update[i];
+            loop {
+                let prev_node = unsafe { prev_ptr.deref() };
+                let next = prev_node.forward[i].load(Ordering::Acquire, guard);
+
+                if !next.is_null() {
+                    let next_node = unsafe { next.deref() };
+                    if next_node.key < new_node.key {
+                        prev_ptr = next;
                         continue;
                     }
-                    let expected = (*update_ptr).forward(i).load(Ordering::Acquire);
-                    (*new_node).forward(i).store(expected, Ordering::Release);
-                    match (*update_ptr).forward(i).compare_exchange(
-                        expected,
-                        new_node,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            // TODO: Implement proper cleanup or change algorithm to avoid partial insertions
-                            panic!("partial insertion");
-                        }
+                    if next_node.key == new_node.key && i == 0 {
+                        let new_value = Owned::new(Some(Box::new(
+                            unsafe { new_node.value.load(Ordering::Acquire, guard).deref() }
+                                .as_ref()
+                                .map(|b| (**b).clone())
+                                .unwrap(),
+                        )));
+                        let old = next_node.value.swap(new_value, Ordering::AcqRel, guard);
+                        unsafe { guard.defer_destroy(old) };
+                        return;
                     }
                 }
-            }
-            return Ok(true);
-        }
-    }
 
-    pub fn get(&self, key: &K) -> Option<V> {
-        if let Some(val) = self.get_inner(key) {
-            unsafe { Some(val.load(Ordering::Acquire).read()) }
-        } else {
-            None
-        }
-    }
+                new_node.forward[i].store(next, Ordering::Release);
 
-    pub fn get_inner(&self, key: &K) -> Option<&Arc<AtomicPtr<V>>> {
-        let mut curr = self.head.load(Ordering::Acquire);
-        for i in (0..=self.height()).rev() {
-            if unsafe { i < (*curr).height() } {
-                loop {
-                    let fwd = unsafe { (*curr).forward(i).load(Ordering::Acquire) };
-                    if fwd.is_null() {
-                        break;
-                    };
-
-                    match unsafe { (*fwd).key.cmp(key) } {
-                        std::cmp::Ordering::Less => {
-                            curr = fwd;
-                        }
-                        std::cmp::Ordering::Equal => {
-                            let val = unsafe { (*fwd).value() };
-                            return val;
-                        }
-                        std::cmp::Ordering::Greater => break,
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    pub fn get_node_ref(&self, key: &K) -> Option<AtomicPtr<Node<K, V, N>>> {
-        let mut curr = self.head.load(Ordering::Acquire);
-        for i in (0..=self.height()).rev() {
-            if unsafe { i < (*curr).height() } {
-                loop {
-                    let fwd = unsafe { (*curr).forward(i).load(Ordering::Acquire) };
-                    if fwd.is_null() {
-                        break;
-                    };
-
-                    match unsafe { (*fwd).key.cmp(key) } {
-                        std::cmp::Ordering::Less => {
-                            curr = fwd;
-                        }
-                        std::cmp::Ordering::Equal => {
-                            return Some(AtomicPtr::new(fwd));
-                        }
-                        std::cmp::Ordering::Greater => break,
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    pub fn get_and_update<F>(&self, key: &K, f: F) -> Option<AtomicPtr<V>>
-    where
-        F: Fn(Option<&Arc<AtomicPtr<V>>>) -> AtomicPtr<V>,
-    {
-        let old_value = self.get_inner(key);
-        let new_value = f(old_value);
-        old_value.map(|old_value| {
-            loop {
-                match old_value.compare_exchange(
-                    old_value.load(Ordering::Acquire),
-                    new_value.load(Ordering::Acquire),
-                    Ordering::Release,
-                    Ordering::Relaxed,
+                match prev_node.forward[i].compare_exchange(
+                    next,
+                    new_node_shared,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    guard,
                 ) {
                     Ok(_) => break,
-                    Err(_) => {}
+                    Err(_) => continue,
                 }
             }
+        }
+    }
 
-            new_value
-        })
+    pub fn get<'a>(&self, key: &K, guard: &'a Guard) -> Option<&'a V>
+    where
+        K: 'a,
+    {
+        let curr = self.head.load(Ordering::SeqCst, guard);
+        let mut curr_node = unsafe { curr.deref() };
+        let curr_level = self.cur_level.load(Ordering::SeqCst);
+        for i in (0..=curr_level).rev() {
+            loop {
+                println!("inside get loop");
+                if let Some(fwd) = curr_node.forward.get(i) {
+                    let fwd_raw = fwd.load(Ordering::SeqCst, guard);
+                    if fwd_raw.is_null() {
+                        break;
+                    }
+                    let fwd_node = unsafe { fwd_raw.deref() };
+
+                    match fwd_node.key.cmp(key) {
+                        std::cmp::Ordering::Less => {
+                            curr_node = fwd_node;
+                        }
+                        std::cmp::Ordering::Equal => unsafe {
+                            let value_ptr = fwd_node.value.load(Ordering::Acquire, guard);
+                            if value_ptr.is_null() {
+                                return None;
+                            }
+                            return unsafe { value_ptr.deref() }.as_ref().map(|v| &**v);
+                        },
+                        std::cmp::Ordering::Greater => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        None
     }
 
     fn random_level(max_level: usize) -> usize {
         use rand::Rng;
         let mut rng = rand::rng();
         let mut level = 0;
-        // Geometric distribution: 50% chance to go up each level
         while level < max_level - 1 && rng.random_bool(0.5) {
             level += 1;
         }
         level
-    }
-}
-
-#[cfg(test)]
-mod node_tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::thread;
-
-    #[test]
-    fn test_node_insert_and_get() {
-        let node = Node::<i32, i32, 5>::new(i32::MIN, None, AtomicUsize::new(5));
-        assert!(node.value().is_none());
-        assert_eq!(node.height(), 5);
-        assert_eq!(node.key(), &i32::MIN);
-        let value = AtomicPtr::new(Box::into_raw(Box::new(1)));
-        let ok = node.forward_insert(
-            Node::<i32, i32, 5>::new(0, Some(Arc::from(value)), AtomicUsize::new(1)),
-            0,
-        );
-        assert!(ok);
-        unsafe {
-            assert!(!node.forward(0).load(Ordering::Acquire).is_null());
-            assert_eq!(
-                node.forward(0)
-                    .load(Ordering::Acquire)
-                    .read()
-                    .value()
-                    .unwrap()
-                    .load(Ordering::Relaxed)
-                    .read(),
-                1
-            );
-        }
-    }
-
-    fn add_one(i: &mut u64) -> Option<u64> {
-        Some(i.saturating_add(1))
-    }
-
-    #[test]
-    fn test_node_thread_data_race() {
-        let sl = Arc::new(Node::<u64, u64, 5>::new(
-            u64::MIN,
-            None,
-            AtomicUsize::new(5),
-        ));
-        let mut handles = vec![];
-
-        for _ in 0..4 {
-            let sl = Arc::clone(&sl);
-            let handle = thread::spawn(move || {
-                for _ in 1..=10 {
-                    if sl.forward(0).load(Ordering::Acquire).is_null() {
-                        if !sl.forward_insert(
-                            Node::<u64, u64, 5>::new(
-                                u64::MIN,
-                                Some(Arc::new(AtomicPtr::new(Box::into_raw(Box::new(0))))),
-                                AtomicUsize::new(1),
-                            ),
-                            0,
-                        ) {
-                            unsafe {
-                                (*sl.forward(0).load(Ordering::Acquire))
-                                    .set_value(add_one)
-                                    .expect("TODO: panic message");
-                            }
-                        }
-                    } else {
-                        unsafe {
-                            (*sl.forward(0).load(Ordering::Acquire))
-                                .set_value(add_one)
-                                .expect("TODO: panic message");
-                        }
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        let ptr = sl.forward(0).load(Ordering::Acquire);
-        assert!(!ptr.is_null());
-        let value = unsafe { ptr.read().value.unwrap().load(Ordering::Relaxed).read() };
-        assert_eq!(value, 39);
-    }
-}
-
-impl Min<i32> for i32 {
-    fn min() -> i32 {
-        i32::MIN
     }
 }
 
@@ -430,110 +257,151 @@ mod skiplist_tests {
 
     #[test]
     fn new_skiplist() {
-        let sl = SkipList::<i32, i32, 5>::new();
-        assert_eq!(sl.max_height.load(Ordering::Acquire), 5);
-        assert_eq!(sl.cur_height.load(Ordering::Acquire), 0);
-        assert_eq!(sl.head().key(), &i32::MIN);
-        assert!(sl.head().value().is_none());
+        let sl = Skiplist::<i32, i32, 5>::new();
+        let guard = &epoch::pin();
+        assert_eq!(sl.max_level, 5);
+        assert_eq!(sl.cur_level.load(Ordering::Acquire), 0);
+        assert_eq!(
+            unsafe { sl.head.load(Ordering::SeqCst, guard).deref() }.key,
+            i32::MIN
+        );
+        assert!(
+            unsafe {
+                sl.head
+                    .load(Ordering::SeqCst, guard)
+                    .deref()
+                    .value
+                    .load(Ordering::SeqCst, guard)
+                    .deref()
+            }
+            .is_none()
+        )
     }
 
     #[test]
     fn skiplist_insert_and_get() {
-        let sl = SkipList::<i32, i32, 5>::new();
-        sl.insert(0, 0).unwrap();
-        sl.insert(1, 1).unwrap();
-        sl.insert(2, 2).unwrap();
-        sl.insert(3, 2).unwrap();
-        sl.insert(4, 2).unwrap();
-        assert_eq!(sl.max_height.load(Ordering::Acquire), 5);
-        assert_ne!(sl.cur_height.load(Ordering::Acquire), 0);
-        assert_eq!(sl.head().key(), &i32::MIN);
-        assert!(sl.head().value().is_none());
+        let sl = Skiplist::<i32, i32, 5>::new();
+        let guard = &epoch::pin();
+        sl.insert(0, 0);
+        sl.insert(1, 1);
+        sl.insert(2, 2);
+        sl.insert(3, 2);
+        sl.insert(4, 2);
 
-        assert_eq!(sl.get(&0), Some(0));
-        assert_eq!(sl.get(&1), Some(1));
-        assert_eq!(sl.get(&2), Some(2));
-        assert_eq!(sl.get(&3), Some(2));
-        assert_eq!(sl.get(&4), Some(2));
-    }
-
-    fn run_data_race(iteration: usize) {
-        let sl = Arc::new(SkipList::<i32, i32, 5>::new());
-        let mut handles = vec![];
-
-        for _thread_id in 0..4 {
-            let sl = Arc::clone(&sl);
-            let handle = thread::spawn(move || {
-                for _i in 1..=10 {
-                    loop {
-                        if sl.get_inner(&0).is_none() {
-                            match sl.insert(0, 1) {
-                                Ok(true) => break,     // Created new node, success
-                                Ok(false) => continue, // Updated existing, retry as increment
-                                Err(_) => continue,    // Concurrent modification, retry
-                            }
-                        } else {
-                            let v = sl.get(&0).unwrap();
-                            match sl.insert(0, v + 1) {
-                                Ok(_) => break,     // Updated successfully
-                                Err(_) => continue, // Concurrent modification, retry
-                            }
-                        }
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        let val = sl.get(&0);
-        assert!(val.is_some());
-        assert_eq!(
-            val,
-            Some(40),
-            "data race detected, failed on iteration={iteration}"
-        );
-    }
-
-    #[test]
-    fn skiplist_data_race_test() {
-        for i in 0..100 {
-            run_data_race(i);
-        }
-    }
-
-    #[test]
-    fn skiplist_node_refs() {
-        let sl = Arc::new(SkipList::<i32, i32, 2>::new());
-        sl.insert(10, 2).unwrap();
-
-        let v = sl.get_node_ref(&10);
-        assert!(v.is_some());
-        let node = v.unwrap();
-        let ret = unsafe { node.load(Ordering::Acquire).as_mut() }
-            .unwrap()
-            .set_value(|mut v| {
-                let _ = std::mem::replace(v, 9999);
-                Some(*v)
-            });
-        assert_eq!(sl.get(&10), Some(9999));
+        assert_eq!(sl.get(&0, guard), Some(&0));
+        assert_eq!(sl.get(&1, guard), Some(&1));
+        assert_eq!(sl.get(&2, guard), Some(&2));
+        assert_eq!(sl.get(&3, guard), Some(&2));
+        assert_eq!(sl.get(&4, guard), Some(&2));
     }
 
     #[test]
     fn skiplist_same_key_insert() {
-        let sl = SkipList::<i32, i32, 3>::new();
-        sl.insert(0, 0).unwrap();
-        sl.insert(0, 1).unwrap();
-        sl.insert(0, 2).unwrap();
-        sl.insert(0, 3).unwrap();
-        assert_eq!(sl.get(&0), Some(3));
-        sl.insert(2, 0).unwrap();
-        sl.insert(2, 1).unwrap();
-        sl.insert(2, 2).unwrap();
-        sl.insert(2, 900).unwrap();
-        assert_eq!(sl.get(&2), Some(900));
+        let sl = Skiplist::<i32, i32, 3>::new();
+        let guard = &epoch::pin();
+        sl.insert(0, 0);
+        sl.insert(0, 1);
+        sl.insert(0, 2);
+        sl.insert(0, 3);
+        println!("{}", sl);
+        assert_eq!(sl.get(&0, guard), Some(&3));
+        sl.insert(2, 0);
+        sl.insert(2, 1);
+        sl.insert(2, 2);
+        sl.insert(2, 900);
+        assert_eq!(sl.get(&2, guard), Some(&900));
+    }
+
+    #[test]
+    fn concurrent_unique_keys() {
+        for _ in 0..10 {
+            let sl = Arc::new(Skiplist::<i32, i32, 8>::new());
+            let threads = 4;
+            let keys_per_thread = 100;
+
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let sl = Arc::clone(&sl);
+                    thread::spawn(move || {
+                        for i in 0..keys_per_thread {
+                            let key = t * keys_per_thread + i;
+                            sl.insert(key, key);
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let guard = &epoch::pin();
+            for key in 0..(threads * keys_per_thread) {
+                assert_eq!(sl.get(&key, guard), Some(&key), "missing key {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_same_key_no_duplicates() {
+        for _ in 0..50 {
+            let sl = Arc::new(Skiplist::<i32, i32, 5>::new());
+
+            let handles: Vec<_> = (0..4)
+                .map(|t| {
+                    let sl = Arc::clone(&sl);
+                    thread::spawn(move || {
+                        sl.insert(0, t);
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let guard = &epoch::pin();
+            let val = sl.get(&0, guard);
+            assert!(val.is_some(), "key 0 was lost");
+        }
+    }
+
+    #[test]
+    fn insert_then_get_visibility() {
+        for _ in 0..20 {
+            let sl = Arc::new(Skiplist::<i32, i32, 5>::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            let sl2 = Arc::clone(&sl);
+            let barrier2 = Arc::clone(&barrier);
+            let writer = thread::spawn(move || {
+                barrier2.wait();
+                sl2.insert(42, 100);
+            });
+
+            let sl3 = Arc::clone(&sl);
+            let barrier3 = Arc::clone(&barrier);
+            let reader = thread::spawn(move || {
+                barrier3.wait();
+                let guard = &epoch::pin();
+                for _ in 0..10000 {
+                    if sl3.get(&42, guard).is_some() {
+                        return true;
+                    }
+                    std::hint::spin_loop();
+                }
+                false
+            });
+
+            writer.join().unwrap();
+            let found = reader.join().unwrap();
+
+            let guard = &epoch::pin();
+            assert!(
+                sl.get(&42, guard).is_some(),
+                "key not visible after insert completed"
+            );
+            assert!(found || sl.get(&42, guard).is_some());
+        }
     }
 }

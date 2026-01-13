@@ -52,7 +52,7 @@ fn btreemap_mixed_workload<const THREADS: usize>(bencher: divan::Bencher) {
 fn lock_free_skiplist_mixed_workload<const THREADS: usize>(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| {
-            let map = Arc::new(skiplist::SkipList::<u64, u64, 5>::new());
+            let map = Arc::new(skiplist::Skiplist::<u64, u64, 5>::new());
             // Pre-populate
             {
                 for i in 0..5000 {
@@ -68,12 +68,13 @@ fn lock_free_skiplist_mixed_workload<const THREADS: usize>(bencher: divan::Bench
             for thread_id in 0..THREADS {
                 let map = Arc::clone(&map);
                 let handle = thread::spawn(move || {
+                    let guard = &crossbeam_epoch::pin();
                     for i in 0..ops_per_thread {
                         let key = thread_id as u64 * ops_per_thread + i;
 
                         // 70% reads, 30% writes
                         if i % 10 < 7 {
-                            divan::black_box(map.get_inner(&(key % 5000)));
+                            divan::black_box(map.get(&(key % 5000), guard));
                         } else {
                             map.insert(key + 5000, key * 2);
                         }
