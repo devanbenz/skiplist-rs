@@ -35,13 +35,6 @@ impl<K, V, const N: usize> Node<K, V, N> {
             forward,
         }
     }
-
-    pub fn forward_ref(&mut self, index: usize) -> Option<&mut Atomic<Node<K, V, N>>> {
-        if index >= N {
-            panic!("index {index} is out of bounds of {N}")
-        }
-        self.forward.get_mut(index)
-    }
 }
 
 pub struct Skiplist<K, V, const N: usize> {
@@ -219,13 +212,13 @@ where
                         std::cmp::Ordering::Less => {
                             curr_node = fwd_node;
                         }
-                        std::cmp::Ordering::Equal => unsafe {
+                        std::cmp::Ordering::Equal => {
                             let value_ptr = fwd_node.value.load(Ordering::Acquire, guard);
                             if value_ptr.is_null() {
                                 return None;
                             }
                             return unsafe { value_ptr.deref() }.as_ref().map(|v| &**v);
-                        },
+                        }
                         std::cmp::Ordering::Greater => break,
                     }
                 } else {
