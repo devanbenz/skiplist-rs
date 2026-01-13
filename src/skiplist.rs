@@ -99,7 +99,6 @@ where
         let current_height = self.cur_level.load(Ordering::SeqCst);
         for i in (0..=current_height).rev() {
             loop {
-                println!("inside update creation");
                 let curr_node = unsafe { curr_ptr.deref() };
                 match curr_node.forward.get(i) {
                     Some(next_atomic) => {
@@ -209,7 +208,6 @@ where
         let curr_level = self.cur_level.load(Ordering::SeqCst);
         for i in (0..=curr_level).rev() {
             loop {
-                println!("inside get loop");
                 if let Some(fwd) = curr_node.forward.get(i) {
                     let fwd_raw = fwd.load(Ordering::SeqCst, guard);
                     if fwd_raw.is_null() {
