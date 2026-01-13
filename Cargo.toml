@@ -1,5 +1,5 @@
 [package]
-name = "skiplist-rs"
+name = "ibis-skiplist"
 version = "0.1.0"
 edition = "2024"
 
